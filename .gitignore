@@ -1,0 +1,45 @@
+# Daml specific
+.daml/
+dist/
+*.dar
+*/*.dar
+*/*/*.dar
+daml-script.log
+
+# IDE specific
+.project
+.classpath
+.settings
+.idea/
+*.iws
+*.iml
+*.ipr
+.bsp/
+
+# OS specific
+.DS_Store
+Thumbs.db
+
+# Dependencies
+node_modules/
+elm-stuff/
+
+# Environment variables
+.env
+.env.local
+.env.development.local
+.env.test.local
+.env.production.local
+
+# Build outputs
+build/
+
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Other
+coverage/
