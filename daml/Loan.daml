@@ -1,0 +1,158 @@
+module Loan where
+
+import DA.Date
+import DA.Time
+import DA.Numeric
+import DA.Assert
+import DA.Either
+import LoanRequest (Collateral) -- Assuming `data Collateral = Collateral with asset: Text, quantity: Numeric 10`
+
+-- | Represents a fully repaid loan. This serves as an archival record of a successful loan lifecycle.
+template ClosedLoan
+  with
+    lender: Party
+    borrower: Party
+    operator: Party
+    loanId: Text
+    principal: Numeric 10
+    finalPaymentTime: Time
+  where
+    signatory operator
+    observer lender, borrower
+
+-- | Represents a loan that was liquidated due to default or insufficient collateral.
+-- This serves as an archival record, capturing the state at the time of liquidation.
+template LiquidatedLoan
+  with
+    lender: Party
+    borrower: Party
+    operator: Party
+    loanId: Text
+    outstandingAtLiquidation: Numeric 10
+    collateral: Collateral
+    liquidationTime: Time
+  where
+    signatory operator
+    observer lender, borrower
+
+-- | Represents an active, funded loan agreement.
+-- Interest accrues on a daily basis and is calculated just-in-time when an action
+-- (like repayment or liquidation) is taken to ensure accuracy.
+template Loan
+  with
+    lender: Party
+    borrower: Party
+    operator: Party
+    loanId: Text
+    principal: Numeric 10 -- The original loan amount
+    interestRate: Numeric 10 -- Annual interest rate, e.g., 0.05 for 5%
+    principalOutstanding: Numeric 10 -- The remaining principal balance
+    accruedInterest: Numeric 10 -- Interest accrued but not yet paid
+    collateral: Collateral
+    liquidationThreshold: Numeric 10 -- Ratio below which liquidation is allowed, e.g., 1.5 for 150%
+    maturityDate: Date
+    lastUpdateTime: Time -- The timestamp of the last update (creation or choice exercise)
+  where
+    signatory lender, borrower, operator
+
+    key (lender, borrower, operator, loanId) : (Party, Party, Party, Text)
+    maintainer key._1, key._2, key._3
+
+    -- Helper function to calculate newly accrued interest and total outstanding balance at a given time.
+    -- Returns a tuple: (Total Outstanding Balance, Total Accrued Interest)
+    let calculateBalance (currentTime: Time) : (Numeric 10, Numeric 10) =
+          -- Time difference in seconds
+          let diffSeconds = seconds (subTime currentTime lastUpdateTime)
+          -- Convert seconds to days for interest calculation, using 365 days per year.
+          let daysElapsed = intToNumeric @10 diffSeconds / (24.0 * 60.0 * 60.0)
+          let dailyInterestRate = interestRate / 365.0
+          let newlyAccruedInterest = principalOutstanding * dailyInterestRate * daysElapsed
+          let totalAccruedInterest = accruedInterest + newlyAccruedInterest
+          let totalOutstanding = principalOutstanding + totalAccruedInterest
+          (totalOutstanding, totalAccruedInterest)
+    in
+
+    -- | Allows the borrower to repay part or all of the loan.
+    -- Payments are applied to accrued interest first, then to the principal.
+    choice Repay : Either (ContractId Loan) (ContractId ClosedLoan)
+      with
+        repaymentAmount: Numeric 10
+        now: Time
+      controller borrower
+      do
+        assertMsg "Repayment time must be after the last update time." (now > lastUpdateTime)
+        let (totalOutstanding, totalAccrued) = calculateBalance now
+        assertMsg "Repayment amount must be positive." (repaymentAmount > 0.0)
+        assertMsg ("Repayment amount " <> show repaymentAmount <> " cannot exceed the outstanding balance of " <> show totalOutstanding)
+                  (repaymentAmount <= totalOutstanding + 0.00001) -- Add tolerance for precision
+
+        -- Payments cover interest first, then principal.
+        let paymentToInterest = min repaymentAmount totalAccrued
+        let paymentToPrincipal = repaymentAmount - paymentToInterest
+
+        let newPrincipalOutstanding = principalOutstanding - paymentToPrincipal
+        let newAccruedInterest = totalAccrued - paymentToInterest
+
+        -- If principal is paid off (within tolerance), the loan is closed.
+        if newPrincipalOutstanding <= 0.00001 then do
+          closedCid <- create ClosedLoan with
+            lender, borrower, operator, loanId, principal
+            , finalPaymentTime = now
+          archive self
+          return (Right closedCid)
+        else do
+          -- Partial repayment: archive this and create a new updated loan contract.
+          newLoanCid <- create this with
+            principalOutstanding = newPrincipalOutstanding
+            , accruedInterest = newAccruedInterest
+            , lastUpdateTime = now
+          archive self
+          return (Left newLoanCid)
+
+    -- | Allows the lender or operator to liquidate the loan.
+    -- This is permissible if the collateral value falls below the required threshold or
+    -- if the loan is past its maturity date.
+    choice Liquidate : ContractId LiquidatedLoan
+      with
+        currentCollateralPrice: Numeric 10
+        now: Time
+      controller lender, operator
+      do
+        assertMsg "Liquidation time must be after the last update time." (now > lastUpdateTime)
+        let (totalOutstanding, _) = calculateBalance now
+
+        assertMsg "Outstanding balance must be positive for liquidation." (totalOutstanding > 0.0)
+        assertMsg "Collateral price must be positive for valuation." (currentCollateralPrice > 0.0)
+        let collateralValue = collateral.quantity * currentCollateralPrice
+
+        let collateralRatio = collateralValue / totalOutstanding
+        let isPastMaturity = date (toGregorian now) >= maturityDate
+
+        assertMsg ("Liquidation conditions not met. Collateral ratio is " <> show collateralRatio <>
+                   " (threshold: " <> show liquidationThreshold <> "), and maturity date has " <>
+                   (if isPastMaturity then "passed" else "not passed") <> ".")
+                  (collateralRatio < liquidationThreshold || isPastMaturity)
+
+        liquidatedCid <- create LiquidatedLoan with
+          lender, borrower, operator, loanId, collateral
+          , outstandingAtLiquidation = totalOutstanding
+          , liquidationTime = now
+        archive self
+        return liquidatedCid
+
+    -- | Allows the borrower to add more collateral to the loan, for example, to avoid liquidation.
+    choice TopUpCollateral : ContractId Loan
+      with
+        additionalQuantity: Numeric 10
+        assetName: Text
+      controller borrower
+      do
+        -- Ensure the added collateral is of the same asset type.
+        assertMsg "Collateral asset type must match existing collateral." (assetName == collateral.asset)
+        -- Ensure a positive quantity is added.
+        assertMsg "Additional collateral quantity must be positive." (additionalQuantity > 0.0)
+
+        let newCollateral = collateral with quantity = collateral.quantity + additionalQuantity
+        newLoanCid <- create this with collateral = newCollateral
+        archive self
+        return newLoanCid
