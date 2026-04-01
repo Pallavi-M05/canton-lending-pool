@@ -1,0 +1,137 @@
+module LoanRequest where
+
+import DA.Date
+import DA.Time
+
+-- | Represents a borrower's public request for a loan on the P2P lending platform.
+-- This contract is observable by potential lenders and the platform operator, allowing
+-- any interested lender to make a funding offer.
+template LoanRequest
+  with
+    borrower : Party
+      -- ^ The party requesting the loan.
+    operator : Party
+      -- ^ The operator of the lending platform, responsible for governance.
+    principal : Decimal
+      -- ^ The amount of money the borrower wants to borrow.
+    currency : Text
+      -- ^ The currency of the loan (e.g., "USD", "EUR").
+    interestRate : Decimal
+      -- ^ The annual interest rate proposed by the borrower (e.g., 0.05 for 5%).
+    termInDays : Int
+      -- ^ The desired duration of the loan in days.
+    collateralAsset : Text
+      -- ^ The type of asset offered as collateral (e.g., "BTC", "ETH").
+    collateralAmount : Decimal
+      -- ^ The amount of the collateral asset offered.
+    requestId : Text
+      -- ^ A unique identifier for this loan request, provided by the borrower.
+  where
+    signatory borrower
+    observer operator
+
+    key (operator, borrower, requestId) : (Party, Party, Text)
+    maintainer key._1
+
+    ensure
+      principal > 0.0 &&
+      interestRate >= 0.0 &&
+      termInDays > 0 &&
+      collateralAmount > 0.0
+
+    -- | Allows the borrower to withdraw their loan request at any time before it
+    -- receives a funding offer.
+    choice Withdraw : ()
+      controller borrower
+      do
+        archive self
+
+    -- | Allows a potential lender to offer to fund the loan based on the terms
+    -- specified in the request. This action archives the original request to
+    -- prevent multiple funding offers and creates a `FundedLoanProposal`
+    -- that the borrower must then explicitly accept.
+    choice OfferToFund : ContractId FundedLoanProposal
+      with
+        lender : Party
+          -- ^ The party offering to fund the loan.
+      controller lender
+      do
+        -- A party cannot lend to themselves.
+        assertMsg "Lender and borrower cannot be the same party." (lender /= borrower)
+
+        -- The loan funding starts from the moment the offer is made.
+        -- Calculate the maturity date based on the current time.
+        now <- getTime
+        let maturityDate = addDays (timeToDate now) (fromIntegral termInDays)
+
+        create FundedLoanProposal with
+          borrower
+          lender
+          operator
+          principal
+          currency
+          interestRate
+          termInDays
+          maturityDate
+          collateralAsset
+          collateralAmount
+          requestId
+
+-- | Represents a concrete offer from a specific lender to fund a loan request.
+-- This contract is created when a lender exercises the `OfferToFund` choice on a
+-- `LoanRequest`. The borrower must then accept this proposal to proceed with
+-- the loan, which would involve locking collateral and creating the final
+-- `LoanAgreement`.
+template FundedLoanProposal
+  with
+    borrower : Party
+      -- ^ The recipient of the loan.
+    lender : Party
+      -- ^ The provider of the loan funds.
+    operator : Party
+      -- ^ The platform operator.
+    principal : Decimal
+      -- ^ The amount of the loan.
+    currency : Text
+      -- ^ The currency of the loan.
+    interestRate : Decimal
+      -- ^ The annual interest rate.
+    termInDays : Int
+      -- ^ The loan term in days.
+    maturityDate : Date
+      -- ^ The calculated date when the loan is due for full repayment.
+    collateralAsset : Text
+      -- ^ The asset to be locked as collateral.
+    collateralAmount : Decimal
+      -- ^ The amount of the collateral asset.
+    requestId : Text
+      -- ^ The original request identifier.
+  where
+    signatory lender, operator
+    observer borrower
+
+    key (operator, borrower, requestId) : (Party, Party, Text)
+    maintainer key._1
+
+    -- | Allows the borrower to reject the funding offer from the lender. This
+    -- archives the proposal. The borrower would need to create a new `LoanRequest`
+    -- to seek funding again.
+    choice Reject : ()
+      controller borrower
+      do
+        archive self
+
+    -- | Allows the borrower to accept the funding offer. This is the final step
+    -- in the agreement phase. Exercising this choice should trigger the creation
+    -- of the main `LoanAgreement` contract and the process of locking the
+    -- borrower's collateral.
+    -- (The creation of `LoanAgreement` is handled in a separate module).
+    choice Accept : ()
+      controller borrower
+      do
+        -- In a full implementation, this choice would create the `LoanAgreement`
+        -- contract, which represents the active, funded loan.
+        -- e.g., `create LoanAgreement with ..`
+        -- For the purpose of this module, we consume the proposal by archiving it,
+        -- completing this stage of the workflow.
+        archive self
