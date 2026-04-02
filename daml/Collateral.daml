@@ -1,0 +1,72 @@
+module Collateral where
+
+-- | Represents the final state of collateral after a loan default and liquidation.
+-- This contract serves as an audit trail, signifying that the ownership of the
+-- underlying off-ledger asset has been transferred from the borrower to the lender.
+template LiquidatedCollateral
+  with
+    lender : Party
+      -- ^ The new owner of the collateral.
+    borrower : Party
+      -- ^ The original owner of the collateral.
+    operator : Party
+      -- ^ The custodian who managed the collateral lock and transfer.
+    collateralAsset : Text
+      -- ^ A description of the liquidated asset (e.g., "10 ETH").
+    collateralValue : Decimal
+      -- ^ The value of the asset at the time it was originally locked.
+    loanId : Text
+      -- ^ The unique ID of the loan that was defaulted on.
+  where
+    signatory lender, operator
+    observer borrower
+
+-- | Represents an asset locked as collateral to secure a loan.
+-- The contract is created by the borrower and a platform operator, and is observed
+-- by the lender. The lender holds exclusive rights to exercise choices that
+-- either release or liquidate the collateral, typically triggered by actions on
+-- the associated `Loan` contract.
+template Collateral
+  with
+    borrower : Party
+      -- ^ The owner of the collateral asset.
+    lender : Party
+      -- ^ The beneficiary of the collateral; can authorize its release or liquidation.
+    operator : Party
+      -- ^ The platform or custodian responsible for managing the collateral lock.
+    collateralAsset : Text
+      -- ^ A description of the locked asset (e.g., "10 ETH").
+    collateralValue : Decimal
+      -- ^ The value of the collateral at the time of locking.
+    loanId : Text
+      -- ^ The unique identifier of the loan this collateral secures.
+  where
+    signatory borrower, operator
+    observer lender
+
+    key (operator, loanId) : (Party, Text)
+    maintainer key._1
+
+    -- | Releases the collateral back to the borrower. This choice should be
+    -- exercised by the associated `Loan` contract upon full repayment.
+    -- Archiving this contract signals the operator to perform the off-ledger
+    -- return of the asset.
+    choice Release : ()
+      controller lender
+      do
+        archive self
+
+    -- | Liquidates the collateral, transferring its ownership to the lender.
+    -- This choice should be exercised by the associated `Loan` contract in a
+    -- default scenario. It creates a `LiquidatedCollateral` contract as a
+    -- permanent record of the event.
+    choice Liquidate : ContractId LiquidatedCollateral
+      controller lender
+      do
+        create LiquidatedCollateral with
+          lender = lender
+          borrower = borrower
+          operator = operator
+          collateralAsset = collateralAsset
+          collateralValue = collateralValue
+          loanId = loanId
