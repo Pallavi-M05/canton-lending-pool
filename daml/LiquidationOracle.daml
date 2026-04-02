@@ -1,0 +1,69 @@
+module LiquidationOracle where
+
+import DA.Time (Time)
+import DA.Assert ((assert))
+
+-- | Represents an established oracle provider on the network.
+-- This contract grants the `oracle` party the authority to publish price data
+-- that `observers` can consume.
+template OracleRole
+  with
+    oracle: Party
+      -- ^ The party authorized to publish price data.
+    observers: [Party]
+      -- ^ Parties who can see the price data published by this oracle.
+  where
+    signatory oracle
+    observer observers
+
+    key oracle : Party
+    maintainer key
+
+    -- | Allows the oracle to publish a new price for a given asset.
+    choice PublishPrice : ContractId PriceData
+      with
+        assetSymbol: Text
+          -- ^ The symbol of the asset, e.g., "BTC", "ETH", "CantonCoin".
+        price: Numeric 10
+          -- ^ The price of the asset, typically in a reference currency like USD.
+        timestamp: Time
+          -- ^ The time at which the price was observed.
+      controller oracle
+      do
+        assert (price > 0.0) $ "Price must be positive, but got " <> show price
+        create PriceData with
+          oracle
+          assetSymbol
+          price
+          timestamp
+          observers
+
+-- | A contract representing a specific price point for an asset at a given time.
+-- These contracts are created by an authorized oracle and serve as on-ledger evidence
+-- of asset prices, which can be used by other contracts (e.g., Loan) to trigger
+-- actions like liquidation.
+template PriceData
+  with
+    oracle: Party
+      -- ^ The party that published this price data.
+    assetSymbol: Text
+      -- ^ The symbol of the asset.
+    price: Numeric 10
+      -- ^ The observed price.
+    timestamp: Time
+      -- ^ The timestamp of the price observation.
+    observers: [Party]
+      -- ^ Parties who can observe this price data.
+  where
+    signatory oracle
+    observer observers
+
+    key (oracle, assetSymbol, timestamp) : (Party, Text, Time)
+    maintainer key._1
+
+    -- | Allows the oracle to archive this specific price point. This is useful for
+    -- ledger pruning and removing outdated data.
+    choice ArchivePriceData : ()
+      controller oracle
+      do
+        pure ()
