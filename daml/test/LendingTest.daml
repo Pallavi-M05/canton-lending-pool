@@ -1,0 +1,224 @@
+module LendingTest where
+
+import Daml.Script
+
+-- Daml Standard Library Imports
+import DA.Assert
+import DA.Date (Month(..), date, addDays)
+import DA.Time (time, addRelTime, days)
+import DA.Text (pack)
+
+-- Project-specific Imports
+import LoanRequest
+import Loan
+import Collateral
+import LiquidationOracle
+
+-- | The main test suite for the lending pool lifecycle.
+lendingTests = script do
+  -- === Test Setup ===
+  operator <- allocateParty "Operator"
+  borrower <- allocateParty "Borrower"
+  lender <- allocateParty "Lender"
+  oracle <- allocateParty "Oracle"
+  debug "Parties allocated."
+
+  -- === Scenario 1: Successful Loan Origination and Full Repayment ===
+  debug "\n--- Running Scenario 1: Successful Repayment ---"
+  runRepaymentScenario operator borrower lender
+
+  -- === Scenario 2: Loan Liquidation Due to Collateral Devaluation ===
+  debug "\n--- Running Scenario 2: Loan Liquidation ---"
+  runLiquidationScenario operator borrower lender oracle
+
+  return ()
+
+
+-- | Test scenario covering a loan that is successfully funded and repaid in full.
+runRepaymentScenario: Party -> Party -> Party -> Script ()
+runRepaymentScenario operator borrower lender = script do
+  -- 1. Borrower creates a LoanRequest.
+  let loanRequest = LoanRequest with
+        operator = operator
+        borrower = borrower
+        principal = 1000.0
+        asset = "USD"
+        interestRate = 0.05 -- 5% per annum
+        termDays = 30
+        collateralAmount = 2.0
+        collateralAsset = "ETH"
+        -- For this scenario, liquidation details are not exercised.
+        oracle = operator -- Dummy oracle
+        liquidationThreshold = 1.25
+
+  loanRequestCid <- submit borrower do
+    createCmd loanRequest
+  debug $ "Borrower created LoanRequest: " <> show loanRequestCid
+
+  -- 2. Borrower locks collateral.
+  let collateral = Collateral with
+        owner = borrower
+        amount = loanRequest.collateralAmount
+        asset = loanRequest.collateralAsset
+  
+  collateralCid <- submit borrower do
+    createCmd collateral
+  debug $ "Borrower locked Collateral: " <> show collateralCid
+
+  -- 3. Lender funds the loan.
+  -- In a real system, the operator would act as an intermediary or observer.
+  -- For this test, we assume the lender can see the contracts.
+  fetchedRequestCid <- submit lender do
+    queryContractId borrower loanRequestCid
+  fetchedCollateralCid <- submit lender do
+    queryContractId borrower collateralCid
+
+  -- The lender exercises the FundLoan choice.
+  (loanCid, _) <- submit lender do
+    exerciseCmd fetchedRequestCid FundLoan with
+      lender = lender
+      collateralCid = fetchedCollateralCid
+  debug $ "Lender funded loan, creating Loan contract: " <> show loanCid
+
+  -- Verify LoanRequest and Collateral are archived.
+  submit lender do
+    res <- queryContractId borrower loanRequestCid
+    assert (res == None)
+  submit lender do
+    res <- queryContractId borrower collateralCid
+    assert (res == None)
+  debug "Verified that LoanRequest and original Collateral are archived."
+
+  -- 4. Borrower makes a partial repayment.
+  debug "Borrower making partial repayment of 500.0 USD."
+  updatedLoanCid <- submit borrower do
+    exerciseCmd loanCid Repay with amount = 500.0
+  debug $ "Loan contract updated after partial repayment: " <> show updatedLoanCid
+  
+  -- Verify the loan state.
+  updatedLoan <- submit borrower do fetch updatedLoanCid
+  assertMsg "Principal paid should be 500.0" (updatedLoan.principalPaid == 500.0)
+
+  -- 5. Borrower makes the final repayment.
+  -- The 'dueAmount' field on the Loan contract should calculate the remaining principal plus any accrued interest.
+  let finalRepaymentAmount = updatedLoan.dueAmount
+  debug $ "Borrower making final repayment of " <> show finalRepaymentAmount
+  
+  (returnedCollateralCid: ContractId Collateral) <- submit borrower do
+    exerciseCmd updatedLoanCid Repay with amount = finalRepaymentAmount
+  debug $ "Final repayment made. Collateral returned: " <> show returnedCollateralCid
+
+  -- Verify the loan is archived and collateral is returned to the borrower.
+  submit borrower do
+    res <- queryContractId borrower updatedLoanCid
+    assert (res == None)
+  debug "Verified that the Loan contract is archived."
+  
+  returnedCollateral <- submit borrower do fetch returnedCollateralCid
+  assertMsg "Returned collateral should be owned by the borrower" (returnedCollateral.owner == borrower)
+  assertMsg "Returned collateral amount should be correct" (returnedCollateral.amount == loanRequest.collateralAmount)
+  debug "Scenario 1 completed successfully."
+
+
+-- | Test scenario covering loan liquidation.
+runLiquidationScenario: Party -> Party -> Party -> Party -> Script ()
+runLiquidationScenario operator borrower lender oracle = script do
+  -- 1. Operator designates an Oracle.
+  let oracleRole = OracleRole with operator, oracle
+  oracleRoleCid <- submit operator do createCmd oracleRole
+  debug "OracleRole created."
+
+  -- 2. Oracle sets an initial price for the collateral asset.
+  now <- getTime
+  let initialPrice = OraclePrice with
+        oracle
+        asset = "ETH"
+        price = 1500.0 -- 1 ETH = 1500 USD
+        lastUpdated = now
+  
+  (initialPriceCid, _) <- submit oracle do
+    exerciseCmd oracleRoleCid CreatePrice with
+      asset = initialPrice.asset
+      price = initialPrice.price
+      time = now
+  debug $ "Oracle set initial price for ETH: " <> show initialPriceCid
+
+  -- 3. Borrower creates a LoanRequest.
+  let loanRequest = LoanRequest with
+        operator = operator
+        borrower = borrower
+        principal = 2000.0
+        asset = "USD"
+        interestRate = 0.10 -- 10%
+        termDays = 90
+        collateralAmount = 2.0
+        collateralAsset = "ETH"
+        oracle = oracle
+        liquidationThreshold = 1.25 -- 125% LTV
+
+  loanRequestCid <- submit borrower do
+    createCmd loanRequest
+  debug $ "Borrower created a new LoanRequest for liquidation scenario."
+
+  -- 4. Borrower locks collateral.
+  let collateral = Collateral with
+        owner = borrower
+        amount = loanRequest.collateralAmount
+        asset = loanRequest.collateralAsset
+  collateralCid <- submit borrower do
+    createCmd collateral
+  debug $ "Borrower locked collateral for the new loan."
+
+  -- 5. Lender funds the loan.
+  fetchedRequestCid <- submit lender do
+    queryContractId borrower loanRequestCid
+  fetchedCollateralCid <- submit lender do
+    queryContractId borrower collateralCid
+    
+  (loanCid, _) <- submit lender do
+    exerciseCmd fetchedRequestCid FundLoan with
+      lender = lender
+      collateralCid = fetchedCollateralCid
+  debug $ "Lender funded the loan: " <> show loanCid
+  
+  -- Initial state check: Collateral value = 2.0 * 1500.0 = 3000.0 USD
+  -- Loan principal = 2000.0 USD
+  -- Liquidation level = 2000.0 * 1.25 = 2500.0 USD
+  -- 3000.0 > 2500.0, so it's not liquidatable yet.
+
+  -- 6. Oracle updates the price downwards.
+  let updatedPrice = 1200.0 -- 1 ETH = 1200 USD
+  newTime <- getTime
+  (updatedPriceCid, _) <- submit oracle do
+    exerciseByKeyCmd @OraclePrice (oracle, "ETH") UpdatePrice with newPrice = updatedPrice, time = newTime
+  debug "Oracle updated ETH price downwards to 1200.0 USD."
+
+  -- New state check: Collateral value = 2.0 * 1200.0 = 2400.0 USD
+  -- Liquidation level = 2500.0 USD
+  -- Now, 2400.0 < 2500.0, so the loan should be liquidatable.
+
+  -- 7. Lender liquidates the loan.
+  debug "Lender is attempting to liquidate the loan."
+  
+  -- Lender needs to see the updated price contract to pass it to the choice.
+  fetchedPriceCid <- submit lender do
+    lookupByKey @OraclePrice (oracle, "ETH") >>= \case
+      Some cid -> return cid
+      None -> error "Oracle price not found"
+
+  (liquidatedCollateralCid: ContractId Collateral) <- submit lender do
+    exerciseCmd loanCid Liquidate with priceCid = fetchedPriceCid
+  debug $ "Loan successfully liquidated. Collateral transferred to lender: " <> show liquidatedCollateralCid
+
+  -- 8. Verify the outcome.
+  -- Loan should be archived.
+  submit lender do
+    res <- queryContractId borrower loanCid
+    assert (res == None)
+  debug "Verified that the liquidated Loan contract is archived."
+  
+  -- Collateral should now belong to the lender.
+  liquidatedCollateral <- submit lender do fetch liquidatedCollateralCid
+  assertMsg "Liquidated collateral should be owned by the lender" (liquidatedCollateral.owner == lender)
+  assertMsg "Liquidated collateral amount should be correct" (liquidatedCollateral.amount == loanRequest.collateralAmount)
+  debug "Scenario 2 completed successfully."
